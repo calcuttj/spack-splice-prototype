@@ -179,19 +179,33 @@ def without_dev_path(spec):
 def remove_dependency(spec, name: str) -> list:
     """Drop ``spec``'s edges on ``name``. Returns the removed edges.
 
-    ``_dependencies`` is a plain ``Dict[str, List[DependencySpec]]``
-    (``spec.py:1049``), so the edge has to come out of both the parent's dependency
-    map and the child's ``_dependents`` back-map. ``Spec.detach()`` is not the tool
-    for this -- it detaches a node from its parents, not one child edge.
+    The edge has to come out of both the parent's dependency map and the child's
+    ``_dependents`` back-map. Both are ``_EdgeMap``, which is a
+    ``collections.abc.Mapping`` (``spec.py:1033``): it *reads* like a dict, but its
+    only mutators are ``add`` and ``clear``, so a single edge has to be removed from
+    the ``edges`` dict it wraps. Deleting through the mapping itself raises
+    ``TypeError: '_EdgeMap' object does not support item deletion``, which stayed
+    hidden until a dev package depended on another dev package -- the first case
+    where an edge is re-pointed rather than merely read.
+
+    Empty keys are dropped rather than left behind, because ``add`` never creates
+    one: a name present in the map always has at least one edge.
+
+    ``Spec.detach()`` is not the tool for this -- it detaches a node from its
+    parents, not one child edge.
     """
     removed = []
+    out_edges = spec._dependencies.edges
     for edge in list(spec.edges_to_dependencies(name=name)):
-        spec._dependencies[name].remove(edge)
-        if not spec._dependencies[name]:
-            del spec._dependencies[name]
-        back = edge.spec._dependents.get(spec.name, [])
+        out_edges[name].remove(edge)
+        if not out_edges[name]:
+            del out_edges[name]
+        back_edges = edge.spec._dependents.edges
+        back = back_edges.get(spec.name, [])
         if edge in back:
             back.remove(edge)
+            if not back:
+                del back_edges[spec.name]
         removed.append(edge)
     return removed
 

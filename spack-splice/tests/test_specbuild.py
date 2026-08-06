@@ -113,6 +113,86 @@ def test_frontier_is_read_from_the_reconciled_specs():
     assert specbuild.frontier_of(buildable) == {"h-newly-added"}
 
 
+def _linked(parent_name, child_name):
+    """Two real Specs joined by one real edge.
+
+    Deliberately not a fake. ``remove_dependency`` exists to mutate Spack's
+    ``_EdgeMap``, and a fake dict-of-lists satisfies dict semantics that the real
+    class does not -- which is exactly how the deletion bug below survived: every
+    test passed while a two-package dev set could not be reported at all.
+    """
+    import spack.deptypes as dt
+    import spack.spec
+
+    parent, child = spack.spec.Spec(parent_name), spack.spec.Spec(child_name)
+    parent.add_dependency_edge(child, depflag=dt.BUILD | dt.LINK, virtuals=(), direct=True)
+    return parent, child
+
+
+def test_remove_dependency_drops_the_edge_both_ways():
+    parent, child = _linked("cetlib", "cetlib-except")
+    removed = specbuild.remove_dependency(parent, "cetlib-except")
+
+    assert len(removed) == 1
+    assert not parent.edges_to_dependencies(name="cetlib-except")
+    assert not child.edges_from_dependents(name="cetlib")
+
+
+def test_remove_dependency_leaves_no_empty_keys():
+    """``_EdgeMap.add`` never creates an empty list, so neither may we: a name in
+    the map with no edges is a shape the rest of Spack never produces."""
+    parent, child = _linked("cetlib", "cetlib-except")
+    specbuild.remove_dependency(parent, "cetlib-except")
+
+    assert "cetlib-except" not in parent._dependencies
+    assert "cetlib" not in child._dependents
+    assert len(parent._dependencies) == 0
+
+
+def test_remove_dependency_keeps_other_edges():
+    parent, child = _linked("cetlib", "cetlib-except")
+    import spack.deptypes as dt
+    import spack.spec
+
+    other = spack.spec.Spec("boost")
+    parent.add_dependency_edge(other, depflag=dt.LINK, virtuals=(), direct=True)
+
+    specbuild.remove_dependency(parent, "cetlib-except")
+    assert [e.spec.name for e in parent.edges_to_dependencies()] == ["boost"]
+
+
+def test_replace_dependency_repoints_at_the_dev_build():
+    """The whole point: a dev package depending on another dev package must end up
+    pointing at the dev build. This is the path that raised ``TypeError: '_EdgeMap'
+    object does not support item deletion`` on any dev set larger than one."""
+    import spack.spec
+
+    parent, installed = _linked("cetlib", "cetlib-except")
+    replacement = spack.spec.Spec("cetlib-except")
+
+    specbuild.replace_dependency(parent, "cetlib-except", replacement)
+
+    edges = parent.edges_to_dependencies(name="cetlib-except")
+    assert len(edges) == 1
+    assert edges[0].spec is replacement
+    assert not installed.edges_from_dependents(name="cetlib")
+
+
+def test_replace_dependency_preserves_the_edge_attributes():
+    """A re-pointed edge must keep its deptypes, or the rebuilt spec quietly stops
+    being a link dependency and the dev build is never linked against."""
+    import spack.spec
+
+    parent, _ = _linked("cetlib", "cetlib-except")
+    original = parent.edges_to_dependencies(name="cetlib-except")[0]
+    depflag, virtuals, direct = original.depflag, original.virtuals, original.direct
+
+    specbuild.replace_dependency(parent, "cetlib-except", spack.spec.Spec("cetlib-except"))
+
+    new = parent.edges_to_dependencies(name="cetlib-except")[0]
+    assert (new.depflag, new.virtuals, new.direct) == (depflag, virtuals, direct)
+
+
 def main():
     """Standalone runner, for environments without pytest."""
     failures = []
