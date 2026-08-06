@@ -14,3 +14,42 @@ Caveat: since it might rely on a spack env's externals, one must be able to prov
 
 
 ## Steps ###
+### -1. Set up a subspack ###
+Follow the instructions [here]([url](https://fnalssi.github.io/spack-at-fnal/pages/build_manager_process.html#preparing-a-spack-build-instance)) 
+
+
+This allows you to see several environments with specs you can build off of
+
+i.e. by runing 
+`spack -e dunesw-10_22_00d00-justin-01_06_01-prototype spec`
+
+### 0. Set up spack-splice ###
+<pre>
+git clone git@github.com:calcuttj/spack-splice-prototype.git
+spack config add $PWD/spack-splice-prototype/spack-splice
+</pre>
+
+### 1. Set up dev area 
+<pre>
+  spack splice init dunesw-10_22_00d00-justin-01_06_01-prototype --root dunesw
+</pre>
+
+### 2. Add a package to develop 
+<pre>
+  spack splice add cetlib-except
+</pre>
+
+### 3. Fetch its src
+<pre>
+  spack splice src 
+</pre>
+
+### 4. Build it
+<pre>
+  spack splice build
+</pre>
+
+### 5. Optional: tar it
+<pre>
+  spack splice pack 
+</pre>
