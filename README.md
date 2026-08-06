@@ -26,7 +26,7 @@ i.e. by runing
 ### 0. Set up spack-splice ###
 <pre>
 git clone git@github.com:calcuttj/spack-splice-prototype.git
-spack config add $PWD/spack-splice-prototype/spack-splice
+spack config add "config:extensions:[$PWD/spack-splice-prototype/spack-splice]"
 </pre>
 
 ### 1. Set up dev area 
