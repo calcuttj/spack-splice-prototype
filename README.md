@@ -9,7 +9,7 @@ It can also be used to create relocatable software by using RUNPATH (which is su
 
 There is a command to create tarballs that can be published to cvmfs along with a setup script that defines the environment. This isn't perfect but is a demonstration of what we can do with better coding of this.
 
-Caveat: since it relies on a spack env's externals, one must be able to provide these. I.e. on a worker node image missing make/ninja, one must bind mount that into the container.
+Caveat: since it might rely on a spack env's externals, one must be able to provide these when building. I.e. on a worker node image missing make/ninja, one must bind mount that into the container.
 
 
 
