@@ -31,7 +31,7 @@ spack config add $PWD/spack-splice-prototype/spack-splice
 
 ### 1. Set up dev area 
 <pre>
-  spack splice init dunesw-10_22_00d00-justin-01_06_01-prototype --root dunesw
+  spack splice init dunesw-10_22_00d00-justin-01_06_01-prototype --root dunesw -d dev_area/
 </pre>
 
 ### 2. Add a package to develop 
