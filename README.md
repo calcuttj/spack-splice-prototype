@@ -15,7 +15,7 @@ Caveat: since it might rely on a spack env's externals, one must be able to prov
 
 ## Steps ###
 ### -1. Set up a subspack ###
-Follow the instructions [here]([url](https://fnalssi.github.io/spack-at-fnal/pages/build_manager_process.html#preparing-a-spack-build-instance)) 
+Follow the instructions [here](https://fnalssi.github.io/spack-at-fnal/pages/build_manager_process.html#preparing-a-spack-build-instance) 
 
 
 This allows you to see several environments with specs you can build off of
