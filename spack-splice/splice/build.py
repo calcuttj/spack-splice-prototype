@@ -10,6 +10,7 @@ fidelity: ``cmake_args``, patches, ``setup_build_environment``, cetmodules quirk
 everything else run exactly as they would under ``spack install``.
 """
 
+import contextlib
 import os
 import re
 
@@ -42,33 +43,58 @@ class BuildError(spack.error.SpackError):
     """Raised when a dev package cannot be built."""
 
 
-def fetch_source(node, dest: str) -> None:
-    """Download ``node``'s source into ``dest``.
+@contextlib.contextmanager
+def staged_in(build_root: str):
+    """Put Spack's stages -- and so the build directories -- under ``build_root``.
 
-    Follows ``spack develop``'s approach (``cmd/develop.py:78``): build the package
-    class directly rather than going through ``Spec.package``, stage it, then steal
-    the staged tree.
+    Without this a dev build lands in ``$tempdir/$user/spack-stage``: CMake's build
+    directory hangs off ``stage.path``, and a ``DevelopStage`` takes its path from
+    the stage root like any other. That is the wrong place for a dev area. The build
+    tree is the thing you go and read when a compile fails, it should survive a
+    reboot, and it should go away when the dev area does.
 
-    ``node`` must be the *installed* spec, not the dev one -- a spec carrying
-    ``dev_path`` gets a ``DevelopStage``, which has no fetcher to steal from.
+    ``get_stage_root`` memoizes its answer in a module global, so overriding the
+    config is not enough on its own -- the cached value has to be dropped on the way
+    in and on the way out.
     """
-    if os.path.exists(dest) and os.listdir(dest):
-        tty.msg(f"{node.name}: source already present at {dest}")
-        return
+    os.makedirs(build_root, exist_ok=True)
+    saved = spack.stage._stage_root
+    with spack.config.CONFIG.override("config:build_stage", build_root):
+        spack.stage._stage_root = None
+        try:
+            yield
+        finally:
+            spack.stage._stage_root = saved
 
-    pkg_cls = spack.repo.PATH.get_pkg_class(node.name)
-    package = pkg_cls(node)
-    stage = package.stage[0]
 
-    if isinstance(stage.fetcher, spack.fetch_strategy.GitFetchStrategy):
-        # A cached or mirrored clone may have truncated history, which is useless
-        # for development.
-        stage.fetcher.get_full_repo = True
-        stage.default_fetcher_only = True
+# Deprecated
+# def fetch_source(node, dest: str) -> None:
+#     """Download ``node``'s source into ``dest``.
 
-    stage.fetcher.set_package(package)
-    tty.msg(f"{node.name}: fetching source into {dest}")
-    package.stage.steal_source(dest)
+#     Follows ``spack develop``'s approach (``cmd/develop.py:78``): build the package
+#     class directly rather than going through ``Spec.package``, stage it, then steal
+#     the staged tree.
+
+#     ``node`` must be the *installed* spec, not the dev one -- a spec carrying
+#     ``dev_path`` gets a ``DevelopStage``, which has no fetcher to steal from.
+#     """
+#     if os.path.exists(dest) and os.listdir(dest):
+#         tty.msg(f"{node.name}: source already present at {dest}")
+#         return
+
+#     pkg_cls = spack.repo.PATH.get_pkg_class(node.name)
+#     package = pkg_cls(node)
+#     stage = package.stage[0]
+
+#     if isinstance(stage.fetcher, spack.fetch_strategy.GitFetchStrategy):
+#         # A cached or mirrored clone may have truncated history, which is useless
+#         # for development.
+#         stage.fetcher.get_full_repo = True
+#         stage.default_fetcher_only = True
+
+#     stage.fetcher.set_package(package)
+#     tty.msg(f"{node.name}: fetching source into {dest}")
+#     package.stage.steal_source(dest)
 
 
 def check_buildable(spec) -> None:
@@ -226,17 +252,17 @@ def build_one(spec, prefix: str, jobs=None, stop_at=None) -> None:
     if not os.path.isdir(source.value):
         raise BuildError(
             f"{spec.name}: no source at {source.value}",
-            "Run 'spack splice src' to fetch it, or point at a checkout with "
-            "'spack splice add --path'.",
+            "Re-add it with 'spack splice add', or point at a checkout with "
+            "'spack splice add --src'.",
         )
 
     spec.set_prefix(prefix)
     pkg = spec.package
 
     if jobs:
-        spack.config.set("config:build_jobs", jobs, scope="command_line")
+        spack.config.CONFIG.set("config:build_jobs", jobs, scope="command_line")
 
-    with spack.config.override(*LINKING_OVERRIDE):
+    with spack.config.CONFIG.override(*LINKING_OVERRIDE):
         spack.build_environment.setup_package(pkg, dirty=False, context=Context.BUILD)
         builder = spack.builder.create(pkg)
         # Phases run with the source directory as cwd, the same as

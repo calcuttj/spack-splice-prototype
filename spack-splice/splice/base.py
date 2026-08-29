@@ -305,6 +305,44 @@ def env_of(source: str):
     return locator if kind == "env" else None
 
 
+def reload(base_hash: str, environment: str = None):
+    """Re-load the concrete spec a dev area was created against.
+
+    Goes back to the environment ``init`` used, when there was one, rather than
+    assuming the store: an environment's concrete roots are not necessarily
+    installed, and its lock is the only place the exact DAG is written down.
+
+    Selects by the recorded hash, never by name, so that a re-concretized
+    environment is reported as such instead of silently swapping the base out.
+    """
+    if environment:
+        if not os.path.isdir(environment):
+            raise BaseSpecError(
+                f"the environment this dev area was created from is gone: {environment}",
+                "Re-run 'spack splice init'.",
+            )
+        _path, roots = concrete_roots(environment)
+        spec = next((r for r in roots if r.dag_hash() == base_hash), None)
+        if spec is None:
+            raise BaseSpecError(
+                f"{environment} no longer has a root with hash {base_hash[:7]}:"
+                f"\n  {_listing(roots)}",
+                "It has been re-concretized since 'spack splice init'. Re-run init.",
+            )
+        source = f"env:{environment}"
+    else:
+        found = spack.store.STORE.db.get_by_hash(base_hash)
+        if not found:
+            raise BaseSpecError(
+                f"base spec {base_hash[:7]} is no longer installed",
+                "The dev area is stale. Re-run 'spack splice init'.",
+            )
+        spec = found[0] if isinstance(found, list) else found
+        source = f"store:{base_hash[:7]}"
+
+    return require_installed(spec, source)
+
+
 def rehydrate(state):
     """Re-load the base spec recorded in a dev area's state.
 

@@ -180,27 +180,24 @@ def remove_dependency(spec, name: str) -> list:
     """Drop ``spec``'s edges on ``name``. Returns the removed edges.
 
     The edge has to come out of both the parent's dependency map and the child's
-    ``_dependents`` back-map. Both are ``_EdgeMap``, which is a
-    ``collections.abc.Mapping`` (``spec.py:1033``): it *reads* like a dict, but its
-    only mutators are ``add`` and ``clear``, so a single edge has to be removed from
-    the ``edges`` dict it wraps. Deleting through the mapping itself raises
-    ``TypeError: '_EdgeMap' object does not support item deletion``, which stayed
-    hidden until a dev package depended on another dev package -- the first case
-    where an edge is re-pointed rather than merely read.
+    ``_dependents`` back-map. Both are plain ``dict`` of name -> list of
+    ``DependencySpec``; they used to be ``_EdgeMap``, a read-only Mapping wrapping an
+    ``edges`` dict, and this reached through ``.edges`` to mutate it. Spack dropped
+    that wrapper, so the dict is now the map itself.
 
-    Empty keys are dropped rather than left behind, because ``add`` never creates
-    one: a name present in the map always has at least one edge.
+    Empty keys are dropped rather than left behind, to match what Spack's own edge
+    handling leaves in place: a name present in the map always has at least one edge.
 
     ``Spec.detach()`` is not the tool for this -- it detaches a node from its
     parents, not one child edge.
     """
     removed = []
-    out_edges = spec._dependencies.edges
+    out_edges = spec._dependencies
     for edge in list(spec.edges_to_dependencies(name=name)):
         out_edges[name].remove(edge)
         if not out_edges[name]:
             del out_edges[name]
-        back_edges = edge.spec._dependents.edges
+        back_edges = edge.spec._dependents
         back = back_edges.get(spec.name, [])
         if edge in back:
             back.remove(edge)
@@ -350,7 +347,11 @@ def dev_nodes(spliced, names):
     return {s.name: s for s in spliced.traverse() if s.name in set(names)}
 
 
-def assign_prefixes(specs_by_name, state):
+def prefix_for(area: str, name: str, dag_hash: str) -> str:
+    return os.path.join(area, "install", f"{name}-{dag_hash[:7]}")
+
+
+def assign_prefixes(specs_by_name, area: str):
     """Point each dev spec at a prefix inside the dev area.
 
     Dev builds never enter the store, so their prefixes are ours to choose.
@@ -360,22 +361,18 @@ def assign_prefixes(specs_by_name, state):
     """
     prefixes = {}
     for name, spec in specs_by_name.items():
-        prefix = state.prefix_for(name, spec.dag_hash())
+        prefix = prefix_for(area, name, spec.dag_hash())
         spec.set_prefix(prefix)
         prefixes[name] = prefix
     return prefixes
 
 
-def source_paths(state, names):
-    """Source directory for each dev package.
-
-    Implied packages -- ones pulled into the dev set rather than picked -- have no
-    directory of their own, so they default to ``<dev-area>/src/<name>``.
-    """
+def source_paths(packages, area: str, names):
+    """Source directory for each dev package, as recorded by ``splice add``."""
     return {
-        name: state.picks[name]["path"]
-        if name in state.picks
-        else os.path.join(state.source_root, name)
+        name: packages[name]["path"]
+        if name in packages
+        else os.path.join(area, "fetched_srcs", name)
         for name in names
     }
 
@@ -395,50 +392,39 @@ class Computed(NamedTuple):
     order: list
 
 
-def compute(state, root, weave_dag: bool = True) -> "Computed":
+def compute(root, packages, area: str, weave_dag: bool = True) -> "Computed":
     """Derive the buildable specs, prefixes and spliced DAG for the dev set.
 
+    ``packages`` is the dev area's recorded set: package name -> ``{"path": ...}``.
     ``buildable`` maps package name -> the spec to compile (build deps intact);
     ``spliced`` is the woven DAG, useful for reporting but *not* for building --
     see :func:`build_specs`. Pass ``weave_dag=False`` to skip the splice when only
     the buildable specs are needed.
+
+    The dev set is exactly what was chosen, with no interval closure: the base is
+    linked with RUNPATH, so an untouched package between two dev packages still
+    loads the dev build through LD_LIBRARY_PATH and does not need rebuilding.
 
     No concretization happens here, which is why it costs seconds rather than the
     22.7s a real solve of art-suite takes.
     """
     from spack.extensions.splice import graph
 
-    # Packages added with --new are not in the base DAG, so they take a different
-    # route: constructed from the recipe rather than copied from an installed node.
-    existing = [n for n, p in state.picks.items() if not p.get("new")]
-    added = [n for n, p in state.picks.items() if p.get("new")]
-
-    picks = graph.resolve_picks(root, existing)
-    dev = graph.dev_set(root, picks.values())
+    picks = graph.resolve_picks(root, list(packages))
+    dev = set(picks.values())
     nodes, _, _ = graph.adjacency(root, graph.PROPAGATE)
 
-    names = [nodes[h].name for h in dev] + added
-    source_for = source_paths(state, names)
+    names = [nodes[h].name for h in dev]
+    source_for = source_paths(packages, area, names)
 
     _by_hash, buildable, drifts = build_specs(root, dev, source_for)
     order = [nodes[h].name for h in graph.build_order(root, dev)]
-
-    # New packages come last: nothing already in the stack can depend on one without
-    # a recipe edit, and that edit is drift, handled above.
-    for name in sorted(added):
-        buildable[name] = new_spec(name, root, source_for[name], prefer=buildable)
-        order.append(name)
-
-    prefixes = assign_prefixes(buildable, state)
+    prefixes = assign_prefixes(buildable, area)
 
     spliced = None
     if weave_dag:
         spliced = weave(root, dev, source_for)
-        # Only the *substituted* packages are checked. A --new package is an
-        # addition to the stack, not a replacement of a node in it, and
-        # ``Spec.splice`` can only swap something that is already there -- so new
-        # packages are deliberately absent from the woven DAG.
-        verify_dev_nodes(spliced, [nodes[h].name for h in dev])
+        verify_dev_nodes(spliced, names)
 
     return Computed(spliced, buildable, prefixes, drifts, order)
 
@@ -465,15 +451,20 @@ def verify_dev_nodes(spliced, names) -> None:
         )
 
 
-def save(state, spliced) -> None:
-    with open(state.spliced_file, "w") as f:
+def spliced_file(area: str) -> str:
+    """Where the woven DAG is cached, so pack need not recompute it."""
+    return os.path.join(area, "spliced.json")
+
+
+def save(area: str, spliced) -> None:
+    with open(spliced_file(area), "w") as f:
         f.write(spliced.to_json(hash=ht.dag_hash))
 
 
-def load(state):
+def load(area: str):
     """Read back the cached spliced DAG, or None if there isn't one."""
     try:
-        with open(state.spliced_file) as f:
+        with open(spliced_file(area)) as f:
             return spack.spec.Spec.from_json(f)
     except OSError:
         return None

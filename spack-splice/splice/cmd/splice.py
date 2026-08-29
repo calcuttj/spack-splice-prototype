@@ -3,14 +3,18 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 import yaml
 
 import spack.cmd
 import spack.error
 import spack.hash_types
+import spack.repo
+import spack.util.git
 import spack.util.tty as tty
 from spack.util.tty.colify import colify
 
@@ -21,6 +25,7 @@ from spack.extensions.splice import (
     graph,
     pack,
     runtime,
+    shadow,
     specbuild,
     state,
     view,
@@ -40,6 +45,33 @@ subcommands = [
 ]
 
 _dispatch = {}
+
+#: The dev area on disk. Their presence is how a dev area is told from any old
+#: directory, so ``init`` creates them and every other command insists on them.
+SPLICE_YAML = "splice.yaml"
+SUBDIRS = ("build", "install", "fetched_srcs")
+
+
+def read_area(path: str) -> dict:
+    """Load ``splice.yaml`` from the dev area at ``path``, checking it is one."""
+    area = Path(path)
+    missing = [n for n in (SPLICE_YAML, *SUBDIRS) if not (area / n).exists()]
+    if missing:
+        tty.die(
+            f"{path} is not a splice dev area: no {', '.join(missing)}",
+            "Run 'spack splice init' there first.",
+        )
+
+    with open(area / SPLICE_YAML) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data.get("splice"), dict) or "hash" not in data["splice"]:
+        tty.die(f"{area / SPLICE_YAML} is not readable as splice state")
+    return data
+
+
+def write_area(path: str, data: dict) -> None:
+    with open(Path(path, SPLICE_YAML), "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
 def setup_parser(subparser: argparse.ArgumentParser) -> None:
@@ -105,34 +137,30 @@ def splice_init(args):
 
     ## Make build/ install/ fetched_srcs/ splice.yaml
     Path(args.dir).mkdir(exist_ok=True)
-    dir_paths = [Path(args.dir, n) for n in ['build', 'install', 'fetched_srcs']]
-    for dp in dir_paths:
+    for dp in [Path(args.dir, n) for n in SUBDIRS]:
         try:
             dp.mkdir(parents=True, exist_ok=False)
         except:
             tty.die(f'{args.dir} already contains {dp}')
 
     try:
-        Path(args.dir, 'splice.yaml').touch(exist_ok=False)
+        Path(args.dir, SPLICE_YAML).touch(exist_ok=False)
     except:
-        tty.die(f'{args.dir} already contains splice.yaml')
-    
+        tty.die(f'{args.dir} already contains {SPLICE_YAML}')
+
 
     # Record what it resolved *to*, not just what was typed: 'args.spec' may be
     # None or a hash prefix, and --env may be a name that later points elsewhere.
     # 'environment' is the resolved directory (holding spack.yaml and spack.lock),
     # or null when the base came from the store.
-    splice_yaml_data = {
+    write_area(args.dir, {
         'splice': {
             'spec': spec.format('{name}{@version}'),
             'hash': spec.dag_hash(),
             'environment': base.env_of(source),
+            'packages': {},
         }
-    }
-
-    with open(Path(args.dir, 'splice.yaml'), 'w') as file:
-        yaml.dump(splice_yaml_data, file, default_flow_style=False, sort_keys=False)
-
+    })
 
     tty.msg(
         f"dev area at {args.dir}",
@@ -148,57 +176,387 @@ def splice_init(args):
 
 
 def splice_add_setup_parser(subparser):
-    """choose packages within the base spec to develop locally
-
-    Splice works out the rest of the rebuild set for you: anything lying on a
-    dependency path between two chosen packages is pulled in automatically.
+    """choose package within the base spec to develop locally
     """
-    subparser.add_argument("packages", nargs="+", help="package names within the base spec")
-    # subparser.add_argument(
-    #     "-p",
-    #     "--path",
-    #     default=None,
-    #     help="source directory (default: <dev-area>/src/<package>)",
-    # )
+    subparser.add_argument("package", help="package name within the base spec")
     subparser.add_argument(
         "-d", "--dir", default=".", help="directory for the dev area (default: cwd)"
     )
-    # subparser.add_argument(
-    #     "--new",
-    #     action="store_true",
-    #     help="add a package that is not in the base spec, built from its recipe",
-    # )
-    _dir_arg(subparser)
+    subparser.add_argument(
+        "-s", "--src", default=None,
+        type=str,
+        help="Source code for the package." \
+            " If none provided, attempt to grab from git using the git repo defined in package.py." \
+            " If the git repo is not defined within package.py, an empty directory is made in fetched_srcs/<package>" \
+            " If a git repo url is provided. The repo is cloned down within fetched_srcs/<package>" \
+            " Otherwise, a path may be provided."
+    )
+    subparser.add_argument(
+        "--allow-unshadowed",
+        action="store_true",
+        help="add the package even though installed packages above it were built "
+        "with RPATH and so will not see the dev build",
+    )
+
+def _occupied(dest: Path) -> bool:
+    """Whether something is already sitting at the clone target."""
+    if not dest.exists():
+        return False
+    if not dest.is_dir():
+        tty.die(f"{dest} exists and is not a directory")
+    return any(dest.iterdir())
+
+
+def _git_ask(dest: Path, *args):
+    """Run a read-only git query in ``dest``, or None if it isn't a checkout."""
+    git = spack.util.git.git()
+    if git is None or not (dest / ".git").exists():
+        return None
+    out = git("-C", str(dest), *args, output=str, error=str, fail_on_error=False)
+    return out.strip() if git.returncode == 0 and out else None
+
+
+def _git_origin(dest: Path):
+    return _git_ask(dest, "remote", "get-url", "origin")
+
+
+def _git_note(dest: Path):
+    """``origin`` and ``describe`` for an existing checkout, for reporting only."""
+    parts = (_git_origin(dest), _git_ask(dest, "describe", "--tags", "--always", "--dirty"))
+    return ", ".join(x for x in parts if x) or None
+
+
+def _same_remote(a: str, b: str) -> bool:
+    return a.rstrip("/").removesuffix(".git") == b.rstrip("/").removesuffix(".git")
+
+
+def _adopt(dest: Path) -> Path:
+    """Reuse sources already sitting at the clone target.
+
+    Mostly reached by re-adding something that was ``rm``ed, since ``rm`` leaves the
+    checkout alone. Nothing is fetched and nothing is checked out: the working tree
+    may hold uncommitted work, and touching it would be a good way to lose it.
+    """
+    note = _git_note(dest)
+    tty.msg(f"reusing the sources already at {dest}" + (f" ({note})" if note else ""))
+    return dest
+
+
+def _clone(url: str, dest: Path) -> Path:
+    git = spack.util.git.git(required=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tty.msg(f"cloning {url}")
+    sys.stdout.flush()  # git writes its progress to stderr; keep the two in order
+    git("clone", url, str(dest))
+    return dest
+
+
+def _recipe_ref(pkg_cls, version):
+    """The git ref a recipe pins ``version`` to, if it pins one.
+
+    Usually it does not: most recipes fetch a tarball and record only a sha256,
+    which says nothing about where the tag lives in the repository.
+    """
+    for candidate, info in pkg_cls.versions.items():
+        if str(candidate) == str(version):
+            return next((info[k] for k in ("commit", "tag", "branch") if info.get(k)), None)
+    return None
+
+
+def _checkout_version(dest: Path, package, pkg_cls, version) -> None:
+    """Move the clone onto whatever matches the installed version.
+
+    Worth the effort: splice builds this source *against* the installed graph, so
+    starting from the default branch instead of the version that was actually
+    installed is a silent way to get an incompatible build.
+
+    The recipe rarely says which ref a version is, so the common tag spellings get
+    tried in turn -- '2.13.0', 'v2.13.0', 'hwloc-2.13.0'.
+    """
+    git = spack.util.git.git(required=True)
+    candidates = (
+        _recipe_ref(pkg_cls, version),
+        str(version),
+        f"v{version}",
+        f"{package}-{version}",
+    )
+    for ref in candidates:
+        if not ref:
+            continue
+        # Captured, not printed: a ref that does not exist is an expected miss here.
+        git(
+            "-C", str(dest), "checkout", "--quiet", ref,
+            output=str, error=str, fail_on_error=False,
+        )
+        if git.returncode == 0:
+            tty.msg(f"checked out {ref}")
+            return
+    tty.warn(
+        f"no ref matching {version} in the repository, so the clone is on its "
+        "default branch. It does not match the installed build -- check out the "
+        "right version yourself before building."
+    )
+
+
+def _attempt_fetch_from_package(package, version, dest: Path) -> Path:
+    """Clone the git repository the recipe declares, if it declares one."""
+    if _occupied(dest):
+        return _adopt(dest)
+
+    try:
+        pkg_cls = spack.repo.PATH.get_pkg_class(package)
+    except Exception as e:  # noqa: BLE001 -- a missing recipe is not fatal here
+        tty.debug(f"no recipe for {package}: {e}")
+        pkg_cls = None
+
+    url = getattr(pkg_cls, "git", None) if pkg_cls else None
+    if not url:
+        dest.mkdir(parents=True, exist_ok=True)
+        tty.warn(
+            f"{package}'s recipe declares no 'git' url, so {dest} is empty. "
+            "Add one to package.py, or re-add with --src.",
+        )
+        return dest
+
+    _clone(url, dest)
+    _checkout_version(dest, package, pkg_cls, version)
+    return dest
+
+
+def _attempt_fetch_from_uri(uri, dest: Path) -> Path:
+    """Clone whatever the user pointed at, as-is. No version is assumed.
+
+    Adopts an existing checkout only when it came from the same place. Naming a
+    url is a statement of intent, so silently keeping sources from somewhere else
+    would be answering a different question than the one asked.
+    """
+    if _occupied(dest):
+        origin = _git_origin(dest)
+        if origin and _same_remote(origin, uri):
+            return _adopt(dest)
+        tty.die(
+            f"{dest} already holds sources" + (f" from {origin}" if origin else "")
+            + f", which is not {uri}",
+            "Remove it, or drop --src to develop what is already there.",
+        )
+    return _clone(uri, dest)
+
+
+def _is_uri(input_string):
+    parsed = urlparse(input_string)
+    # A URI must have a scheme (e.g., http, https, file, ftp)
+    # Windows drive letters (like C:) might misparse as schemes, so we ensure length > 1
+    if parsed.scheme and len(parsed.scheme) > 1:
+        return parsed
+    # scp-style git remotes ('git@host:org/repo.git') carry no scheme at all, but
+    # are still remotes rather than paths.
+    if re.match(r"^[\w.-]+@[\w.-]+:", input_string):
+        return input_string
+    return None
+
+
+def _resolve_src(package, version, src, dest: Path) -> Path:
+    if src is None:
+        return _attempt_fetch_from_package(package, version, dest)
+    if _is_uri(src) is not None:
+        return _attempt_fetch_from_uri(src, dest)
+
+    try:
+        return Path(src).resolve(strict=True)  # Must already exist
+    except OSError:
+        tty.die(f"--src path does not exist: {src}")
+
+
+def _describe_blocked(blocked) -> list:
+    """One line per dependent that will not see a dev build."""
+    rpath = [s for s, verdict in blocked if verdict is False]
+    unknown = [s for s, verdict in blocked if verdict is None]
+    return [s.format("{name}{@version}{/hash:7}") for s in rpath] + [
+        f"{s.format('{name}{@version}')} (could not be inspected)" for s in unknown
+    ]
+
+
+def _require_shadowable(root, package, developed, allow: bool) -> None:
+    """Refuse to develop a package nothing above it can see.
+
+    The dev build reaches its dependents through LD_LIBRARY_PATH, which DT_RPATH
+    overrides. A dependent installed with RPATH keeps the library it was built
+    against, so developing under it changes nothing at run time -- a failure that
+    looks like "my edits do nothing" rather than anything to do with linking. Better
+    to say so now than after a build.
+    """
+    blocked = shadow.blocked_dependents(root, package, developed)
+    if not blocked:
+        return
+
+    detail = _describe_blocked(blocked)
+
+    if allow:
+        sys.stdout.flush()
+        tty.warn(
+            f"{len(blocked)} installed package(s) above {package} will not see the "
+            "dev build, and --allow-unshadowed was given:",
+            *detail,
+        )
+        return
+
+    tty.die(
+        f"{len(blocked)} installed package(s) link {package} directly and cannot be "
+        "redirected to a dev build (DT_RPATH beats LD_LIBRARY_PATH):",
+        *detail,
+        f"Develop them too ('spack splice add <name>'), reinstall them with "
+        "'shared_linking: runpath', or pass --allow-unshadowed to proceed anyway.",
+    )
 
 
 def splice_add(args):
+    data = read_area(args.dir)
+    cfg = data["splice"]
 
-    # TODO -- now, check that this is an init'd area: splice.yaml, fetched_srcs/, etc. need to exist.
-    #         It's ok if they have contents
-    #         Also check that the environment, spec, hash, etc. listed in 
-    #         splice.yaml within args.dir still exist and are installed
-    # root = base.rehydrate(st)
+    # The base has to still be there, and still be installed: an environment can be
+    # re-concretized and a spec uninstalled long after 'init' recorded them.
+    root = base.reload(cfg["hash"], cfg.get("environment"))
 
-    # Then we want to check that the package is within the spec graph given in splice.yaml
-    # If not, then fail but say that functionality might be added at a later date
-    pass
+    # Everything named must already be in the base spec. Adding a package that is
+    # not there would mean concretizing, which splice never does.
+    picks = graph.resolve_picks(root, [args.package])
+
+    # Before fetching anything: if the packages above this one cannot see a dev
+    # build, developing it achieves nothing at run time.
+    _require_shadowable(root, args.package, cfg.get("packages") or {}, args.allow_unshadowed)
+
+    nodes, _, _ = graph.adjacency(root, graph.PROPAGATE)
+    packages = cfg.get("packages") or {}
+
+    # TODO -- just do a simple if-else check
+    already = sorted(set(picks) & set(packages))
+    added = sorted(set(picks) - set(packages))
+
+    # Fetch before recording: a clone that fails should leave splice.yaml untouched
+    # rather than pointing at a directory that was never populated.
+    for name in added:
+        src = _resolve_src(
+            name,
+            nodes[picks[name]].version,
+            args.src,
+            Path(args.dir, "fetched_srcs", name).resolve(),
+        )
+        packages[name] = {"path": str(src)}
+
+    cfg["packages"] = packages
+    write_area(args.dir, data)
+
+    if already:
+        tty.msg(f"already being developed, left alone: {', '.join(already)}")
+    if added:
+        tty.msg(f"now developing: {', '.join(added)}")
+    _report_dev_set(args.dir, root, packages)
+
+
+def _report_dev_set(area, root, packages):
+    """List exactly what will be rebuilt -- which is only what the user chose.
+
+    Deliberately *not* the interval closure of the picks. The base stack is linked
+    with DT_RUNPATH, which LD_LIBRARY_PATH overrides, so an untouched package
+    sitting between two dev packages still loads the dev build at run time and does
+    not need rebuilding. Only a dependent that cannot be shadowed would, and that
+    is a property of its ELF tags rather than of its position in the graph.
+    """
+    nodes, _, _ = graph.adjacency(root, graph.PROPAGATE)
+    by_hash = graph.resolve_picks(root, list(packages))
+
+    print()
+    print(f"developing {len(packages)} of {len(nodes)} packages in {root.name}:")
+    for name in sorted(packages):
+        spec = nodes[by_hash[name]]
+        src = os.path.relpath(packages[name]["path"], os.path.abspath(area))
+        print(f"  {spec.name}@{spec.version}  <- {src}")
 
 
 def splice_rm_setup_parser(subparser):
-    """stop developing packages"""
+    """stop developing packages
+
+    The fetched sources are left where they are, since they may hold work that is
+    not committed anywhere. Remove them yourself if you want them gone.
+    """
     subparser.add_argument("packages", nargs="+", help="package names to unpick")
-    _dir_arg(subparser)
+    subparser.add_argument(
+        "-d", "--dir", default=".", help="directory for the dev area (default: cwd)"
+    )
+    subparser.add_argument(
+        "--allow-unshadowed",
+        action="store_true",
+        help="remove the package even though doing so strands dev packages beneath it",
+    )
+
+
+def _require_remaining_shadowable(root, remaining, removing, allow: bool) -> None:
+    """Refuse a removal that strands whatever is left in the dev set.
+
+    Dropping a package turns it back into an installed binary, and if that binary
+    carries RPATH then the dev packages *below* it stop being visible -- the same
+    condition ``add`` refuses, arrived at from the other direction.
+    """
+    stranded = [
+        (package, blocked)
+        for package in sorted(remaining)
+        for blocked in [shadow.blocked_dependents(root, package, remaining)]
+        if blocked
+    ]
+    if not stranded:
+        return
+
+    detail = [
+        f"{package} <- {line}"
+        for package, blocked in stranded
+        for line in _describe_blocked(blocked)
+    ]
+    removed = ", ".join(removing)
+
+    if allow:
+        sys.stdout.flush()
+        tty.warn(
+            f"removing {removed} strands {len(stranded)} dev package(s), and "
+            "--allow-unshadowed was given:",
+            *detail,
+        )
+        return
+
+    tty.die(
+        f"removing {removed} would leave {len(stranded)} dev package(s) with "
+        "installed dependents that cannot see them:",
+        *detail,
+        "Remove those as well, or pass --allow-unshadowed.",
+    )
 
 
 def splice_rm(args):
-    st = state.find(args.dir)
-    unknown = [p for p in args.packages if p not in st.picks]
+    data = read_area(args.dir)
+    cfg = data["splice"]
+    dev_packages = cfg.get("packages") or {}
+
+    unknown = [p for p in args.packages if p not in dev_packages]
     if unknown:
         tty.die(f"not currently developed: {', '.join(unknown)}")
-    for name in args.packages:
-        del st.picks[name]
-    st.write()
+
+    remaining = {n: v for n, v in dev_packages.items() if n not in args.packages}
+    if remaining:
+        # Advisory only: a dev area whose base has gone must still be prunable, so a
+        # base that will not load costs the check rather than the removal.
+        try:
+            root = base.reload(cfg["hash"], cfg.get("environment"))
+        except spack.error.SpackError as e:
+            tty.warn(f"cannot check what this strands: {e}")
+        else:
+            _require_remaining_shadowable(root, remaining, args.packages, args.allow_unshadowed)
+
+    dropped = [dev_packages[name]["path"] for name in args.packages]
+    cfg["packages"] = remaining
+    write_area(args.dir, data)
+
     tty.msg(f"no longer developing: {', '.join(args.packages)}")
+    for path in dropped:
+        tty.msg(f"sources left in place: {path}")
 
 
 # -- build -----------------------------------------------------------------
@@ -216,19 +574,39 @@ def splice_build_setup_parser(subparser):
     subparser.add_argument(
         "-u", "--until", metavar="PHASE", default=None, help="stop after this phase"
     )
-    _dir_arg(subparser)
+    subparser.add_argument(
+        "-d", "--dir", default=".", help="directory for the dev area (default: cwd)"
+    )
 
 
 def splice_build(args):
-    st = state.find(args.dir)
-    root = base.rehydrate(st)
-    if not st.picks:
+    data = read_area(args.dir)
+    cfg = data["splice"]
+    dev_packages = cfg.get("packages") or {}
+    if not dev_packages:
         tty.die("nothing being developed yet. Use 'spack splice add <package>'.")
+
+    root = base.reload(cfg["hash"], cfg.get("environment"))
+
+    # An empty directory is the usual case here: 'add' makes one when the recipe
+    # declares no git url. Catching it now beats failing deep inside cmake.
+    missing = sorted(
+        name
+        for name, entry in dev_packages.items()
+        if not os.path.isdir(entry["path"]) or not os.listdir(entry["path"])
+    )
+    if missing:
+        tty.die(
+            f"no sources for {', '.join(missing)}",
+            "Put them in place, or re-add with "
+            "'spack splice add <package> --src <path-or-url>'.",
+        )
 
     # Recompute rather than reading the cache: dev prefixes are assigned in memory
     # by Spec.set_prefix and are not part of the serialized spec. The splice is
     # skipped -- we build the hand-built specs, which still have their build deps.
-    computed = specbuild.compute(st, root, weave_dag=False)
+    area = os.path.abspath(args.dir)
+    computed = specbuild.compute(root, dev_packages, area, weave_dag=False)
     buildable, prefixes = computed.buildable, computed.prefixes
 
     order = list(computed.order)
@@ -238,9 +616,15 @@ def splice_build(args):
             tty.die(f"not in the dev set: {', '.join(unknown)}")
         order = [n for n in order if n in set(args.packages)]
 
-    for name in order:
-        tty.msg(f"building {name} -> {prefixes[name]}")
-        build.build_one(buildable[name], prefixes[name], jobs=args.jobs, stop_at=args.until)
+    for d in computed.drifts:
+        tty.warn(f"recipe drift: {d.summary()}")
+
+    # Stages, and so the build trees, live in the dev area rather than $tempdir:
+    # a failed build is something you go and read, and it should die with the area.
+    with build.staged_in(os.path.join(area, "build")):
+        for name in order:
+            tty.msg(f"building {name} -> {prefixes[name]}")
+            build.build_one(buildable[name], prefixes[name], jobs=args.jobs, stop_at=args.until)
 
     sys.stdout.flush()
     _report_linking(prefixes, order)
@@ -284,7 +668,7 @@ def splice_pack_setup_parser(subparser):
     subparser.add_argument(
         "-o", "--output", default=None, help="output path (default: <dev-area-name>.tar.gz)"
     )
-    _dir_arg(subparser)
+    _dir_arg(subparser) # TODO -- Replace 
 
 
 def splice_pack(args):

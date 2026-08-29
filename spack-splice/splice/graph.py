@@ -191,7 +191,9 @@ def resolve_picks(root, names) -> Dict[str, str]:
     if missing:
         raise NoSuchPackageError(
             f"not in this spec: {', '.join(sorted(missing))}",
-            "Use 'spack splice add --new' to add a package that isn't there yet.",
+            "Splice develops a subgraph of something already concrete, so a package "
+            "that is not in the base spec cannot be added. Support for adding new "
+            "packages may come later.",
         )
     if ambiguous:
         detail = "; ".join(f"{n} ({len(h)} builds)" for n, h in ambiguous.items())
