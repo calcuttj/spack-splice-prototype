@@ -4,7 +4,9 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -27,7 +29,6 @@ from spack.extensions.splice import (
     runtime,
     shadow,
     specbuild,
-    state,
     view,
 )
 
@@ -41,6 +42,7 @@ subcommands = [
     ("add",),
     ("rm", "remove"),
     ("build",),
+    ("shell",),
     ("pack",),
 ]
 
@@ -51,6 +53,11 @@ _dispatch = {}
 SPLICE_YAML = "splice.yaml"
 SUBDIRS = ("build", "install", "fetched_srcs")
 
+def _get_packages(cfg):
+    dev_packages = cfg.get("packages") or {}
+    if not dev_packages:
+        tty.die("nothing being developed yet. Use 'spack splice add <package>'.")
+    return dev_packages
 
 def read_area(path: str) -> dict:
     """Load ``splice.yaml`` from the dev area at ``path``, checking it is one."""
@@ -582,9 +589,7 @@ def splice_build_setup_parser(subparser):
 def splice_build(args):
     data = read_area(args.dir)
     cfg = data["splice"]
-    dev_packages = cfg.get("packages") or {}
-    if not dev_packages:
-        tty.die("nothing being developed yet. Use 'spack splice add <package>'.")
+    dev_packages = _get_packages(cfg)
 
     root = base.reload(cfg["hash"], cfg.get("environment"))
 
@@ -653,6 +658,182 @@ def _report_linking(prefixes, names):
             tty.msg(f"{name}: {'/'.join(sorted(tags)) or 'no rpath'} (shadowing works)")
 
 
+# -- setup -----------------------------------------------------------------
+
+
+#: Dialects ``EnvironmentModifications.shell_modifications`` can emit.
+SHELLS = ("sh", "csh", "fish", "bat", "pwsh")
+
+
+def splice_shell_setup_parser(subparser):
+    """set up the run environment for a dev area's packages
+
+    The run environment each package.py declares, with the dev builds in front of
+    the installed stack: the recipes' own variables come from the dev prefixes, and
+    LD_LIBRARY_PATH points at their lib directories so the dev libraries shadow the
+    installed ones.
+
+    Nothing can change the environment of the shell that invoked it, so by default
+    this prints the commands to do so and you apply them yourself:
+
+        eval "$(spack splice shell)"
+
+    Pass --subshell to start a new shell with all of it applied instead, which
+    leaves the current one untouched and ends when you exit.
+    """
+    subparser.add_argument(
+        "-d", "--dir", default=".", help="directory for the dev area (default: cwd)"
+    )
+    subparser.add_argument(
+        "-s",
+        "--subshell",
+        action="store_true",
+        help="start a new shell with the environment applied, rather than printing it",
+    )
+    dialect = subparser.add_mutually_exclusive_group()
+    for name in SHELLS:
+        dialect.add_argument(
+            f"--{name}",
+            action="store_const",
+            dest="shell",
+            const=name,
+            help=f"print {name} commands (default: guessed from $SHELL)",
+        )
+    subparser.set_defaults(shell=None)
+
+
+def _shell_dialect(chosen):
+    """Which dialect to print, from the flag or from ``$SHELL``."""
+    if chosen:
+        return chosen
+    name = os.path.basename(os.environ.get("SHELL", "")).lower()
+    if name in ("csh", "tcsh"):
+        return "csh"
+    if name == "fish":
+        return "fish"
+    return "sh"
+
+
+def _dev_environment(area, cfg):
+    """The base stack's environment with the built dev packages layered in front.
+
+    Only *built* packages take part: an unbuilt one has no prefix on disk, and
+    putting a nonexistent directory on LD_LIBRARY_PATH would quietly do nothing.
+    """
+    packages = _get_packages(cfg)
+
+
+    root = base.reload(cfg["hash"], cfg.get("environment"))
+    computed = specbuild.compute(root, packages, area, weave_dag=False)
+
+    present = runtime.built(computed.prefixes)
+    if not present:
+        tty.die("no dev packages have been built yet. Run 'spack splice build'.")
+
+    unbuilt = sorted(set(computed.prefixes) - set(present))
+    if unbuilt:
+        # stderr, so it cannot end up inside an eval
+        tty.warn(f"not built, so absent from the environment: {', '.join(unbuilt)}")
+
+    env = runtime.modifications(area, root, [computed.buildable[n] for n in sorted(present)])
+    return env, present
+
+
+#: Set inside a subshell so the prompt code, and a second invocation, can see it.
+SPLICE_SHELL_VAR = "SPLICE_SHELL"
+
+
+def _subshell_argv(shell: str, label: str):
+    """``(argv, env overrides)`` for a subshell whose prompt announces ``label``.
+
+    Exporting PS1 does not work: bash and zsh read their startup files after exec
+    and set the prompt unconditionally, overwriting anything inherited. The prompt
+    has to be amended *after* those files run, which each shell offers a hook for --
+    ``--rcfile`` for bash, ``$ZDOTDIR`` for zsh -- so a small rc file is generated
+    that sources the user's own and then prefixes the prompt.
+
+    The rc file removes its own directory once read, so nothing is left behind. Any
+    other shell gets no prompt change: it still gets ``SPLICE_SHELL`` in the
+    environment to key its own prompt off.
+    """
+    name = os.path.basename(shell)
+    if name not in ("bash", "zsh"):
+        return [shell], {}
+
+    tmp = tempfile.mkdtemp(prefix="splice-shell-")
+    quoted_tmp = shlex.quote(tmp)
+    prefix = shlex.quote(f"({label}) ")
+
+    if name == "bash":
+        rc = os.path.join(tmp, "bashrc")
+        script = (
+            "# Generated by 'spack splice shell --subshell'.\n"
+            'if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi\n'
+            f"PS1={prefix}$PS1\n"
+            f"rm -rf {quoted_tmp}\n"
+        )
+        argv = [shell, "--rcfile", rc, "-i"]
+        overrides = {}
+    else:
+        rc = os.path.join(tmp, ".zshrc")
+        # Hand ZDOTDIR back before sourcing, so the user's own startup files -- and
+        # anything they launch later -- look in the usual place.
+        script = (
+            "# Generated by 'spack splice shell --subshell'.\n"
+            'ZDOTDIR="${SPLICE_ZDOTDIR:-$HOME}"\n'
+            "export ZDOTDIR\n"
+            'if [ -f "$ZDOTDIR/.zshrc" ]; then . "$ZDOTDIR/.zshrc"; fi\n'
+            f"PROMPT={prefix}$PROMPT\n"
+            f"rm -rf {quoted_tmp}\n"
+        )
+        argv = [shell, "-i"]
+        overrides = {
+            "ZDOTDIR": tmp,
+            "SPLICE_ZDOTDIR": os.environ.get("ZDOTDIR", os.path.expanduser("~")),
+        }
+
+    with open(rc, "w") as f:
+        f.write(script)
+    return argv, overrides
+
+
+def splice_shell(args):
+    area = os.path.abspath(args.dir)
+    cfg = read_area(args.dir)["splice"]
+    env, present = _dev_environment(area, cfg)
+
+    if not args.subshell:
+        # Only the shell code goes to stdout: anything else would be eval'd.
+        print(runtime.shell_code(env, shell=_shell_dialect(args.shell)))
+        if sys.stdout.isatty():
+            tty.warn(
+                "that was printed, not applied -- a command cannot change the shell "
+                "that ran it.",
+                'Use: eval "$(spack splice shell)", or --subshell for a new shell.',
+            )
+        return
+
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    label = f"splice:{os.path.basename(area.rstrip(os.sep))}"
+
+    if os.environ.get(SPLICE_SHELL_VAR):
+        tty.warn(
+            f"already inside {os.environ[SPLICE_SHELL_VAR]}; this nests another shell "
+            "rather than replacing it."
+        )
+
+    resolved = runtime.as_dict(env)
+    resolved[SPLICE_SHELL_VAR] = label
+    argv, overrides = _subshell_argv(shell, label)
+    resolved.update(overrides)
+
+    tty.msg(
+        f"entering ({label}) with {len(present)} dev package(s) in front: "
+        f"{', '.join(sorted(present))}",
+        f"dev area {area}; 'exit' to leave",
+    )
+    sys.stdout.flush()
+    os.execve(shell, argv, resolved)
 
 # -- pack ------------------------------------------------------------------
 
@@ -668,16 +849,18 @@ def splice_pack_setup_parser(subparser):
     subparser.add_argument(
         "-o", "--output", default=None, help="output path (default: <dev-area-name>.tar.gz)"
     )
-    _dir_arg(subparser) # TODO -- Replace 
+    subparser.add_argument(
+        "-d", "--dir", default=".", help="directory for the dev area (default: cwd)"
+    )
 
 
 def splice_pack(args):
-    st = state.find(args.dir)
-    root = base.rehydrate(st)
-    if not st.picks:
-        tty.die("nothing being developed yet. Use 'spack splice add <package>'.")
+    area = os.path.abspath(args.dir)
+    cfg = read_area(args.dir)["splice"]
+    dev_packages = _get_packages(cfg)
 
-    computed = specbuild.compute(st, root)
+    root = base.reload(cfg["hash"], cfg.get("environment"))
+    computed = specbuild.compute(root, dev_packages, area)
     spliced, buildable, prefixes = computed.spliced, computed.buildable, computed.prefixes
     present = runtime.built(prefixes)
     if not present:
@@ -687,7 +870,7 @@ def splice_pack(args):
         sys.stdout.flush()
         tty.warn(f"not built, so absent from the tarball: {', '.join(unbuilt)}")
 
-    env = runtime.modifications(st, root, [buildable[n] for n in sorted(present)])
+    env = runtime.modifications(area, root, [buildable[n] for n in sorted(present)])
     # Resolve against an *empty* environment, not os.environ: we want only what Spack
     # contributes, so this machine's PATH does not get baked into a portable artifact.
     resolved = {}
@@ -696,9 +879,9 @@ def splice_pack(args):
     # extend the target's values instead of replacing them.
     path_vars = runtime.path_variables(env)
 
-    output = args.output or os.path.join(os.getcwd(), os.path.basename(st.path) + ".tar.gz")
+    output = args.output or os.path.join(os.getcwd(), os.path.basename(area) + ".tar.gz")
     path, digest, packed = pack.create(
-        st, present, resolved, path_vars, root, output, spliced=spliced
+        area, cfg, present, resolved, path_vars, root, output, spliced=spliced
     )
 
     size = os.path.getsize(path)

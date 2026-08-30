@@ -14,9 +14,12 @@ installed binary that links a dev package directly, which keeps its DT_RPATH. Se
 
 import os
 
+import spack.build_environment
+import spack.deptypes as dt
 import spack.util.tty as tty
 import spack.user_environment
 import spack.util.environment as senv
+from spack.enums import Context
 
 #: The one thing the recipes cannot give us. Spack resolves libraries through
 #: RPATH, so it deliberately never puts anything on ``LD_LIBRARY_PATH`` -- neither
@@ -31,7 +34,7 @@ import spack.util.environment as senv
 REQUIRED_PATH_VARS = {"LD_LIBRARY_PATH": ("lib", "lib64")}
 
 
-def modifications(state, root, dev_specs):
+def modifications(area, root, dev_specs):
     """Environment modifications that put the dev builds in front of the stack.
 
     ``root`` is the installed base spec; ``dev_specs`` are the built dev specs, each
@@ -64,6 +67,8 @@ def modifications(state, root, dev_specs):
     if usable:
         env.extend(spack.user_environment.environment_modifications_for_specs(*usable))
 
+    env.extend(dependent_run_environment(root, usable))
+
     # ...plus the floor Spack never provides. Last, so it lands in front.
     for spec in usable:
         for var, subdirs in REQUIRED_PATH_VARS.items():
@@ -78,7 +83,49 @@ def modifications(state, root, dev_specs):
     for var in {m.name for m in env.env_modifications}:
         env.prune_duplicate_paths(var)
 
-    env.set("SPACK_SPLICE_DIR", state.path)
+    env.set("SPACK_SPLICE_DIR", area)
+    return env
+
+
+def dependent_run_environment(root, dev_specs):
+    """Re-run each dev package's ``setup_dependent_run_environment`` for the
+    dependents it has in the *base* spec.
+
+    Spack runs that hook only for dependents inside the subdag it was handed
+    (``build_environment.py:1077`` filters on ``id(spec) in nodes_in_subdag``). The
+    dev specs are passed as roots, so an installed dependent above a dev package is
+    not in that subdag and the hook never fires for it -- while the earlier pass over
+    the installed stack already fired it with the *installed* prefix. The result is a
+    variable pointing at the installed package while ``LD_LIBRARY_PATH`` points at
+    the dev one, which is the sort of half-shadowed state that takes a day to debug.
+
+    A dependent that is itself being developed is skipped: the dev pass covers it,
+    and covers it with the right prefixes on both sides.
+    """
+    from spack.extensions.splice import graph
+
+    env = senv.EnvironmentModifications()
+    dev_by_name = {s.name: s for s in dev_specs}
+    if not dev_by_name:
+        return env
+
+    nodes, _, parents = graph.adjacency(root, dt.LINK | dt.RUN)
+    for h, node in nodes.items():
+        dev = dev_by_name.get(node.name)
+        if dev is None:
+            continue
+        for parent in parents.get(h, set()):
+            dependent = nodes[parent]
+            if dependent.name in dev_by_name:
+                continue
+            pkg = dev.package
+            # The hooks read package.py globals, which Spack's own SetupContext
+            # installs before calling them.
+            spack.build_environment.set_package_py_globals(pkg, context=Context.RUN)
+            try:
+                pkg.setup_dependent_run_environment(env, dependent)
+            except Exception as e:  # noqa: BLE001 -- a recipe hook must not be fatal
+                tty.debug(f"{dev.name}: setup_dependent_run_environment failed: {e}")
     return env
 
 

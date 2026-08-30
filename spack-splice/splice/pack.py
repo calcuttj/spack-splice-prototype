@@ -179,21 +179,26 @@ def modulefile(resolved, path_vars, dev_area, store_root):
     return "\n".join(lines) + "\n"
 
 
-def provenance(state, root, prefixes, spliced=None):
+def provenance(cfg, root, prefixes, spliced=None):
     """What this artifact is and what it needs, as JSON.
 
     Self-describing on purpose: an unpacked tarball on another machine is otherwise
-    an anonymous pile of prefixes.
+    an anonymous pile of prefixes. ``cfg`` is the dev area's ``splice.yaml`` body.
     """
+    packages = cfg.get("packages") or {}
     return {
         "splice": {
-            "base": {"hash": state.base_hash, "source": state.base_source},
+            "base": {
+                "spec": cfg.get("spec"),
+                "hash": cfg.get("hash"),
+                "environment": cfg.get("environment"),
+            },
             "arch": str(root.architecture),
             "store_root": str(spack.store.STORE.layout.root),
             "dev_packages": {
                 name: {
                     "prefix_basename": os.path.basename(prefix),
-                    "source": state.picks.get(name, {}).get("path"),
+                    "source": packages.get(name, {}).get("path"),
                 }
                 for name, prefix in sorted(prefixes.items())
             },
@@ -202,7 +207,7 @@ def provenance(state, root, prefixes, spliced=None):
     }
 
 
-def create(state, prefixes, resolved, path_vars, root, output, spliced=None):
+def create(area, cfg, prefixes, resolved, path_vars, root, output, spliced=None):
     """Write ``output`` (a .tar.gz) containing the dev builds and the scripts.
 
     Uses ``spack.util.archive`` rather than ``tarfile`` directly: it already zeroes
@@ -229,16 +234,16 @@ def create(state, prefixes, resolved, path_vars, root, output, spliced=None):
     store_root = str(spack.store.STORE.layout.root)
     files = {
         f"{name}/setup.sh": (
-            setup_script(resolved, path_vars, state.path, store_root),
+            setup_script(resolved, path_vars, area, store_root),
             0o755,
         ),
         f"{name}/run.sh": (run_script(), 0o755),
         f"{name}/modulefile": (
-            modulefile(resolved, path_vars, state.path, store_root),
+            modulefile(resolved, path_vars, area, store_root),
             0o644,
         ),
         f"{name}/splice.json": (
-            json.dumps(provenance(state, root, present, spliced), indent=2, sort_keys=True)
+            json.dumps(provenance(cfg, root, present, spliced), indent=2, sort_keys=True)
             + "\n",
             0o644,
         ),
