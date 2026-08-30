@@ -186,14 +186,6 @@ def from_environment(name_or_dir: str, spec: str = None):
     return roots[0], f"env:{path}"
 
 
-def from_file(path: str):
-    """Read a concrete spec straight off disk."""
-    spec = spack.spec.Spec.from_specfile(path)
-    if not spec.concrete:
-        raise BaseSpecError(f"{path} does not contain a concrete spec")
-    return spec, f"file:{path}"
-
-
 def host_platform_mismatch(spec):
     """Return ``(spec_platform, host_platform)`` across a linux/darwin/windows split.
 
@@ -341,43 +333,3 @@ def reload(base_hash: str, environment: str = None):
         source = f"store:{base_hash[:7]}"
 
     return require_installed(spec, source)
-
-
-def rehydrate(state):
-    """Re-load the base spec recorded in a dev area's state.
-
-    Goes back to whichever source ``init`` used, rather than assuming the store --
-    an environment's concrete roots are not necessarily installed. Warns if the
-    source has since been re-concretized out from under the dev area.
-    """
-    kind, _, locator = state.base_source.partition(":")
-
-    if kind == "env":
-        # Select by the recorded hash rather than re-asking which root to use: a
-        # multi-root environment would otherwise demand the spec on every command.
-        # Falling back to the plain lookup keeps the "re-concretized" warning below
-        # meaningful when the hash no longer exists.
-        roots = list(ev.Environment(locator).concrete_roots())
-        spec = next((r for r in roots if r.dag_hash() == state.base_hash), None)
-        if spec is None:
-            spec, _ = from_environment(locator)
-        spec = enrich_from_prefix(spec) if _installed(spec) else spec
-    elif kind == "file":
-        spec, _ = from_file(locator)
-    else:
-        found = spack.store.STORE.db.get_by_hash(state.base_hash)
-        if not found:
-            raise BaseSpecError(
-                f"base spec {state.base_hash[:7]} (from {state.base_source}) is no longer "
-                "installed",
-                "The dev area is stale. Re-run 'spack splice init'.",
-            )
-        spec = enrich_from_prefix(found[0] if isinstance(found, list) else found)
-
-    if spec.dag_hash() != state.base_hash:
-        tty.warn(
-            f"{state.base_source} now resolves to {spec.dag_hash()[:7]}, but this dev area "
-            f"was created against {state.base_hash[:7]}. It has been re-concretized; "
-            "your dev set may no longer line up."
-        )
-    return spec

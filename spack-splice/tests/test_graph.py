@@ -1,4 +1,4 @@
-"""Tests for the interval-closure graph algebra.
+"""Tests for the graph algebra: build order, the frontier, and name lookup.
 
 These use hand-built fake DAGs rather than real specs, so they need neither a store
 nor pytest -- run them under ``spack unit-test --extension=splice``, under plain
@@ -67,43 +67,9 @@ def chain():
     return a, b, c, d
 
 
-def test_interval_closure_pulls_in_the_middle():
-    """Picking A and C must also rebuild B, which sits between them."""
-    a, _, _, _ = chain()
-    assert graph.dev_set(a, ["A", "C"]) == {"A", "B", "C"}
-
-
-def test_single_pick_rebuilds_only_itself():
-    """One pick has no interval, so nothing else is implied."""
-    a, _, _, _ = chain()
-    assert graph.dev_set(a, ["C"]) == {"C"}
-
-
-def test_nothing_below_the_lowest_pick():
-    """D is under the dev set and must stay installed, not be rebuilt."""
-    a, _, _, _ = chain()
-    assert "D" not in graph.dev_set(a, ["A", "C"])
-
-
 def test_frontier_is_the_boundary():
     a, _, _, _ = chain()
     assert graph.frontier(a, {"A", "B", "C"}) == {"D"}
-
-
-def test_diamond_includes_both_arms():
-    """A depends on B and C, both of which depend on D. Picking A and D takes all."""
-    a, b, c, d = (FakeSpec(n) for n in "ABCD")
-    a.depends_on(b, c)
-    b.depends_on(d)
-    c.depends_on(d)
-    assert graph.dev_set(a, ["A", "D"]) == {"A", "B", "C", "D"}
-
-
-def test_disjoint_picks_do_not_bridge():
-    """Two picks on unrelated branches imply nothing between them."""
-    root, x, y = FakeSpec("root"), FakeSpec("X"), FakeSpec("Y")
-    root.depends_on(x, y)
-    assert graph.dev_set(root, ["X", "Y"]) == {"X", "Y"}
 
 
 def test_build_order_is_dependency_first():
@@ -127,14 +93,6 @@ def test_build_order_handles_diamonds_without_duplicates():
     assert len(order) == len(set(order)) == 4
     assert order.index("D") < order.index("B") < order.index("A")
     assert order.index("D") < order.index("C") < order.index("A")
-
-
-def test_unshadowable_reports_only_dependents_outside_the_dev_set():
-    a, _, _, _ = chain()
-    # Rebuilding only C: B links it directly and cannot be shadowed.
-    assert graph.unshadowable(a, {"C"}) == {"C": {"B"}}
-    # Rebuilding B and C: nothing outside the set links C any more.
-    assert "C" not in graph.unshadowable(a, {"B", "C"})
 
 
 def main():

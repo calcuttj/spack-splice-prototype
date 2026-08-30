@@ -12,10 +12,9 @@ So for each package above a dev package, one of two things has to be true:
 * it is being developed as well, and so gets rebuilt against the dev package, or
 * its binaries carry RUNPATH, and ``LD_LIBRARY_PATH`` can redirect them.
 
-This module answers that from the ELF files themselves. ``graph.unshadowable``
-answers a related question from the shape of the DAG alone, which was right when the
-base stack was assumed to be RPATH-linked and is too pessimistic now that it need
-not be.
+This module answers that from the ELF files themselves. Answering it from the shape
+of the DAG alone -- as this used to -- was right only while the base stack was
+assumed to be RPATH-linked throughout, and flags every dependent once it is not.
 """
 
 import os

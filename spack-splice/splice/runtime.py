@@ -8,8 +8,9 @@ ever installed, so asking them for a prefix yields a path that does not exist.
 The dev builds are then layered on top by prepending their prefixes. Because they
 are linked with DT_RUNPATH rather than DT_RPATH, ``LD_LIBRARY_PATH`` wins and the
 dev libraries shadow the installed ones -- for everything except an already
-installed binary that links a dev package directly, which keeps its DT_RPATH. See
-``graph.unshadowable``.
+installed binary that carries DT_RPATH, which the loader consults first. ``shadow``
+finds those, and ``splice add`` refuses to develop under one without
+``--allow-unshadowed``.
 """
 
 import os

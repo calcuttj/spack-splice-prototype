@@ -85,97 +85,6 @@ def dev_spec(node, source_path: str, version=None):
     return dev
 
 
-def borrow_abi_nodes(spec, base_root, donor_name=None) -> None:
-    """Give ``spec`` the same compiler and runtime nodes the base stack uses.
-
-    A package that was never in the base spec has no compiler of its own, and
-    recipes ask for one only through the ``c``/``cxx`` virtuals -- which cannot be
-    resolved without the concretizer. Copying the edges from a node that is already
-    in the stack sidesteps that entirely, and is also exactly what ABI compatibility
-    requires: the new package must be built by the same compiler as everything it
-    will link against.
-    """
-    donor = None
-    if donor_name:
-        donor = base_root[donor_name]
-    else:
-        # Any node that has a compiler will do; they are uniform within a stack.
-        for node in base_root.traverse():
-            if node.dependencies(virtuals="cxx") or node.dependencies(virtuals="c"):
-                donor = node
-                break
-    if donor is None:
-        raise SpecBuildError(
-            f"no node in {base_root.name} has a compiler to copy for {spec.name}"
-        )
-
-    have = {e.spec.name for e in spec.edges_to_dependencies()}
-    for edge in donor.edges_to_dependencies():
-        if edge.spec.name in ABI_NODES and edge.spec.name not in have:
-            spec.add_dependency_edge(
-                edge.spec.copy(deps=True),
-                depflag=edge.depflag,
-                virtuals=edge.virtuals,
-                direct=edge.direct,
-            )
-
-
-def new_spec(name: str, base_root, source_path: str, version=None, prefer=None):
-    """Build a concrete Spec for a package that is *not* in the base spec.
-
-    No search happens. The version comes from the recipe's own preference unless
-    given, variants from the recipe's defaults, the compiler from the base stack,
-    and every dependency is resolved by name against the base DAG (then the store).
-    A dependency that exists in neither stops the operation -- see
-    :func:`drift.reconcile`.
-    """
-    import spack.package_base as pb
-    import spack.version as vn
-
-    from spack.extensions.splice import drift
-
-    try:
-        pkg_cls = spack.repo.PATH.get_pkg_class(name)
-    except Exception as e:  # noqa: BLE001 -- an unknown package is a normal user error
-        raise SpecBuildError(f"no recipe found for '{name}'", str(e)) from e
-
-    spec = spack.spec.Spec(name)
-    spec.namespace = pkg_cls.namespace
-    spec.versions = vn.VersionList(
-        [vn.Version(version) if version else pb.preferred_version(pkg_cls)]
-    )
-    spec.architecture = base_root.architecture.copy()
-
-    # A concrete spec carries every compiler-flag key, empty or not. A bare Spec()
-    # has an empty FlagMap, and the build environment then dies on KeyError: 'cflags'
-    # while assembling flags.
-    for flag in spack.spec.FlagMap.valid_compiler_flags():
-        spec.compiler_flags[flag] = []
-
-    borrow_abi_nodes(spec, base_root)
-    # Fills in variant defaults and resolves dependencies, iterating until stable.
-    drift.reconcile(spec, base_root, prefer=prefer)
-
-    spec.variants["dev_path"] = vt.SingleValuedVariant("dev_path", source_path)
-    finalize(spec)
-    return spec
-
-
-def without_dev_path(spec):
-    """A copy of ``spec`` with ``dev_path`` stripped, for fetching.
-
-    ``dev_path`` turns ``pkg.stage`` into a ``DevelopStage`` rooted at the source
-    directory (``package_base.py:1208``), which is exactly what we want at build
-    time and exactly wrong at fetch time -- a DevelopStage has no fetcher.
-    """
-    if "dev_path" not in spec.variants:
-        return spec
-    clean = spec.copy(deps=True)
-    del clean.variants["dev_path"]
-    finalize(clean)
-    return clean
-
-
 def remove_dependency(spec, name: str) -> list:
     """Drop ``spec``'s edges on ``name``. Returns the removed edges.
 
@@ -454,11 +363,6 @@ def verify_dev_nodes(spliced, names) -> None:
 def spliced_file(area: str) -> str:
     """Where the woven DAG is cached, so pack need not recompute it."""
     return os.path.join(area, "spliced.json")
-
-
-def save(area: str, spliced) -> None:
-    with open(spliced_file(area), "w") as f:
-        f.write(spliced.to_json(hash=ht.dag_hash))
 
 
 def load(area: str):

@@ -23,13 +23,11 @@ from spack.util.tty.colify import colify
 from spack.extensions.splice import (
     base,
     build,
-    check,
     graph,
     pack,
     runtime,
     shadow,
     specbuild,
-    view,
 )
 
 description = "develop a subgraph of an installed spec without concretizing"
@@ -96,15 +94,6 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
             help=spack.cmd.doc_first_line(setup),
         )
         setup(sub)
-
-
-def _dir_arg(parser): ## TODO -- Need this?
-    parser.add_argument(
-        "-d",
-        "--dir",
-        default=None,
-        help="splice dev area (default: search upward from cwd, or $SPACK_SPLICE_DIR)",
-    )
 
 
 # -- init ------------------------------------------------------------------

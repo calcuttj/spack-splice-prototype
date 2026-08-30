@@ -70,26 +70,6 @@ def _closure(seeds: Set[str], adj: Dict[str, Set[str]]) -> Set[str]:
     return seen
 
 
-def dev_set(root, picks, deptype=PROPAGATE) -> Set[str]:
-    """The interval closure of ``picks`` within ``root``'s DAG, as dag hashes.
-
-    A node is in the dev set if it lies on some dependency path *between* two
-    picked packages -- that is, it is both an ancestor of a pick and a descendant
-    of a pick. Picks themselves are always included.
-
-    For ``A -> B -> C -> D`` with picks ``{A, C}``::
-
-        descendants = {A, B, C, D}      # what the picks depend on
-        ancestors   = {A, B, C}         # what depends on the picks
-        dev set     = {A, B, C}         # B is pulled in, D is not
-
-    ``D`` stays installed and is symlinked into the dev_view; ``B`` must be rebuilt
-    because it sits between two things that are changing.
-    """
-    _, children, parents = adjacency(root, deptype)
-    seeds = set(picks)
-    return (_closure(seeds, parents) & _closure(seeds, children)) | seeds
-
 
 def build_order(root, dev_hashes, deptype=PROPAGATE):
     """Dev-set hashes in dependency-first order.
@@ -140,31 +120,6 @@ def view_closure(root, frontier_hashes, deptype=PROPAGATE):
     wanted = _closure(set(frontier_hashes), children)
     ordered = root.traverse(deptype=BUILDABLE, order="topo", key=traverse.by_dag_hash)
     return [s for s in ordered if s.dag_hash() in wanted]
-
-
-def unshadowable(root, dev_hashes) -> Dict[str, Set[str]]:
-    """Installed dependents that will *not* see the dev builds.
-
-    A package above the dev set that links a dev package directly keeps the
-    DT_RPATH baked in at install time, and DT_RPATH beats ``LD_LIBRARY_PATH``. Such
-    a dependent silently keeps using the installed library. This is a deliberate
-    trade -- rebuilding them all is what we are avoiding -- but the user needs to
-    be told which ones they are.
-
-    Returns a map of dev package name -> names of dependents that cannot see it.
-    """
-    nodes, _, parents = adjacency(root, dt.LINK)
-    result = {}
-    for h in dev_hashes:
-        stuck = {nodes[p].name for p in parents.get(h, set()) if p not in dev_hashes}
-        if stuck:
-            result[nodes[h].name] = stuck
-    return result
-
-
-def names_in(root, deptype=PROPAGATE):
-    """Every package name reachable from ``root``."""
-    return {spec.name for spec in adjacency(root, deptype)[0].values()}
 
 
 def resolve_picks(root, names) -> Dict[str, str]:
