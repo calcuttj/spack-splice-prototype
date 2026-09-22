@@ -20,10 +20,22 @@ import spack.config
 import spack.error
 import spack.fetch_strategy
 import spack.util.filesystem as fs
-import spack.util.tty as tty
+#import spack.util.tty as tty
+try:
+    import spack.llnl.util.tty as tty
+
+    if not hasattr(tty, "msg"):
+        # spack.llnl.util.tty exists as an empty namespace package in some
+        # Spack versions; fall back to the real module in that case.
+        raise ImportError("spack.llnl.util.tty is an empty namespace package")
+except ImportError:
+    import spack.util.tty as tty
 import spack.repo
 import spack.stage
-from spack.enums import Context
+try:
+  from spack.enums import Context
+except:
+  from spack.context import Context
 
 #: Spack emits DT_RPATH by default, which the loader searches *before*
 #: LD_LIBRARY_PATH and which therefore cannot be shadowed. Dev builds get
@@ -59,6 +71,7 @@ def staged_in(build_root: str):
     """
     os.makedirs(build_root, exist_ok=True)
     saved = spack.stage._stage_root
+    print(spack.config.CONFIG)
     with spack.config.CONFIG.override("config:build_stage", build_root):
         spack.stage._stage_root = None
         try:

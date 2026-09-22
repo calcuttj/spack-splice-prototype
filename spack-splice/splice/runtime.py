@@ -17,10 +17,22 @@ import os
 
 import spack.build_environment
 import spack.deptypes as dt
-import spack.util.tty as tty
+#import spack.util.tty as tty
+try:
+    import spack.llnl.util.tty as tty
+
+    if not hasattr(tty, "msg"):
+        # spack.llnl.util.tty exists as an empty namespace package in some
+        # Spack versions; fall back to the real module in that case.
+        raise ImportError("spack.llnl.util.tty is an empty namespace package")
+except ImportError:
+    import spack.util.tty as tty
 import spack.user_environment
 import spack.util.environment as senv
-from spack.enums import Context
+try:
+  from spack.enums import Context
+except:
+  from spack.context import Context
 
 #: The one thing the recipes cannot give us. Spack resolves libraries through
 #: RPATH, so it deliberately never puts anything on ``LD_LIBRARY_PATH`` -- neither

@@ -64,6 +64,7 @@ def shadowable(spec) -> Optional[bool]:
     verdict = None
     for path in binaries_of(spec.prefix):
         tags = build.linking_type_of(path)
+        print(path, tags)
         if tags is None:  # readelf unavailable, or the file is unreadable
             continue
         if "RPATH" in tags and "RUNPATH" not in tags:
@@ -96,6 +97,8 @@ def blocked_dependents(root, package: str, developed=()) -> List[Tuple[object, O
                 continue
             seen.add(parent)
             verdict = shadowable(dependent)
+            print(dependent, verdict)
+            if verdict is None: continue
             if verdict is not True:
                 blocked.append((dependent, verdict))
     return blocked

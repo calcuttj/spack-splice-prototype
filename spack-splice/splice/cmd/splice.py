@@ -17,8 +17,22 @@ import spack.error
 import spack.hash_types
 import spack.repo
 import spack.util.git
-import spack.util.tty as tty
-from spack.util.tty.colify import colify
+#import spack.util.tty as tty
+try:
+    import spack.llnl.util.tty as tty
+    from spack.llnl.util.tty.colify import colify
+
+    if not hasattr(tty, "msg"):
+        # spack.llnl.util.tty exists as an empty namespace package in some
+        # Spack versions; fall back to the real module in that case.
+        raise ImportError("spack.llnl.util.tty is an empty namespace package")
+    print('Imported')
+except ImportError:
+    print('Normo')
+    import spack.util.tty as tty
+    from spack.util.tty.colify import colify
+
+
 
 from spack.extensions.splice import (
     base,

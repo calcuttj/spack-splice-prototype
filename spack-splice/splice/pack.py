@@ -20,7 +20,16 @@ import os
 import shlex
 
 import spack.error
-import spack.util.tty as tty
+#import spack.util.tty as tty
+try:
+    import spack.llnl.util.tty as tty
+
+    if not hasattr(tty, "msg"):
+        # spack.llnl.util.tty exists as an empty namespace package in some
+        # Spack versions; fall back to the real module in that case.
+        raise ImportError("spack.llnl.util.tty is an empty namespace package")
+except ImportError:
+    import spack.util.tty as tty
 import spack.store
 import spack.util.archive as archive
 
